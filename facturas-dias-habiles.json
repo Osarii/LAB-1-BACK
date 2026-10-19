@@ -1,0 +1,200 @@
+{
+  "name": "Laboratorio 1 - Facturacion centralizada",
+  "nodes": [
+    {
+      "id": "inicio",
+      "name": "Inicio manual",
+      "type": "n8n-nodes-base.manualTrigger",
+      "typeVersion": 1,
+      "position": [
+        0,
+        0
+      ],
+      "parameters": {}
+    },
+    {
+      "id": "leer",
+      "name": "Leer facturas",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        220,
+        0
+      ],
+      "onError": "continueRegularOutput",
+      "parameters": {
+        "url": "http://localhost:3000/facturas",
+        "options": {
+          "timeout": 10000
+        }
+      }
+    },
+    {
+      "id": "calcular",
+      "name": "Calcular con POO y Nager",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        460,
+        0
+      ],
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "// CORE_START: compartido literalmente con el Code node de n8n.\nfunction fechaISO(valor) {\n  if (typeof valor !== 'string' || !/^\\d{4}-\\d{2}-\\d{2}$/.test(valor)) throw new Error('Fecha inválida: use YYYY-MM-DD');\n  const fecha = new Date(valor + 'T00:00:00.000Z');\n  if (!Number.isFinite(fecha.getTime()) || fecha.toISOString().slice(0, 10) !== valor) throw new Error('Fecha inválida');\n  return fecha;\n}\n\nclass CalendarioLaboral {\n  constructor(clienteFeriados, pais = 'CR') {\n    if (typeof clienteFeriados !== 'function') throw new Error('Cliente de feriados obligatorio');\n    if (!/^[A-Z]{2}$/.test(pais)) throw new Error('País inválido');\n    this.cliente = clienteFeriados;\n    this.pais = pais;\n    this.cache = new Map();\n  }\n  async feriados(anio) {\n    if (!this.cache.has(anio)) {\n      let datos;\n      try { datos = await this.cliente(anio, this.pais); }\n      catch (causa) { throw new Error('API_FERIADOS: ' + causa.message); }\n      if (!Array.isArray(datos)) throw new Error('API_FERIADOS: respuesta inválida');\n      const fechas = new Set();\n      for (const dato of datos) {\n        if (!dato || typeof dato !== 'object') throw new Error('API_FERIADOS: feriado inválido');\n        try { fechaISO(dato.date); } catch { throw new Error('API_FERIADOS: fecha inválida'); }\n        if (Number(dato.date.slice(0, 4)) !== anio || dato.countryCode !== this.pais ||\n            !Array.isArray(dato.types) || typeof dato.global !== 'boolean') {\n          throw new Error('API_FERIADOS: esquema inválido');\n        }\n        // Política nacional: Public y global; feriados regionales requieren otra jurisdicción.\n        if (dato.global && dato.types.includes('Public')) fechas.add(dato.date);\n      }\n      this.cache.set(anio, fechas);\n    }\n    return this.cache.get(anio);\n  }\n  async vencimiento(emision) {\n    const fecha = fechaISO(emision);\n    let contados = 0;\n    while (contados < 15) {\n      fecha.setUTCDate(fecha.getUTCDate() + 1);\n      if (fecha.getUTCDay() === 0 || fecha.getUTCDay() === 6) continue;\n      const feriados = await this.feriados(fecha.getUTCFullYear());\n      if (!feriados.has(fecha.toISOString().slice(0, 10))) contados++;\n    }\n    return fecha.toISOString().slice(0, 10);\n  }\n}\n\nclass Factura {\n  constructor(datos) {\n    if (!datos || typeof datos !== 'object' || Array.isArray(datos)) throw new Error('Factura obligatoria');\n    if (!((typeof datos.id === 'string' && datos.id.trim()) ||\n          (Number.isSafeInteger(datos.id) && datos.id > 0))) throw new Error('ID obligatorio');\n    if (typeof datos.cliente !== 'string' || !datos.cliente.trim()) throw new Error('Cliente obligatorio');\n    if (typeof datos.monto !== 'number' || !Number.isFinite(datos.monto) || datos.monto <= 0) throw new Error('Monto debe ser positivo');\n    fechaISO(datos.fechaEmision);\n    if (!['pendiente', 'procesada', 'anulada'].includes(datos.estado)) throw new Error('Estado inválido');\n    if (datos.procesada !== undefined && typeof datos.procesada !== 'boolean') throw new Error('Marca procesada inválida');\n    this.datos = { ...datos };\n  }\n  get omitida() { return this.datos.procesada === true || this.datos.estado !== 'pendiente'; }\n  clasificar(vencimiento, hoy, umbral) {\n    fechaISO(hoy);\n    return {\n      estadoCobro: vencimiento < hoy ? 'vencida' : vencimiento === hoy ? 'vence_hoy' : 'vigente',\n      alerta: vencimiento < hoy ? 'vencida' : vencimiento === hoy ? 'vence_hoy' :\n        this.datos.monto >= umbral ? 'monto_alto' : 'normal'\n    };\n  }\n}\n\nclass ServicioFacturacion {\n  constructor(calendario, { hoy = new Date().toISOString().slice(0, 10), umbral = 10000 } = {}) {\n    fechaISO(hoy);\n    if (!Number.isFinite(umbral) || umbral <= 0) throw new Error('Umbral inválido');\n    this.calendario = calendario;\n    this.hoy = hoy;\n    this.umbral = umbral;\n  }\n  async procesar(datos) {\n    let factura;\n    try { factura = new Factura(datos); }\n    catch (error) { return { actualizar: false, tipo: 'DATOS_INVALIDOS', id: datos?.id ?? null, error: error.message }; }\n    if (factura.omitida) return { actualizar: false, tipo: 'OMITIDA', id: factura.datos.id };\n    try {\n      const fechaVencimiento = await this.calendario.vencimiento(factura.datos.fechaEmision);\n      return {\n        actualizar: true, tipo: 'PROCESADA', id: factura.datos.id,\n        factura: { ...factura.datos, fechaVencimiento, estado: 'procesada', procesada: true,\n          ...factura.clasificar(fechaVencimiento, this.hoy, this.umbral) }\n      };\n    } catch (error) {\n      return { actualizar: false, tipo: 'API_FERIADOS', id: factura.datos.id, error: error.message };\n    }\n  }\n  async procesarTodas(datos) {\n    if (!Array.isArray(datos)) throw new Error('Se requiere una lista de facturas');\n    const resultados = [];\n    for (const factura of datos) resultados.push(await this.procesar(factura));\n    return resultados;\n  }\n}\n// CORE_END\n\nconst entradas = $input.all();\nconst clienteFeriados = async (anio, pais) => await $helpers.httpRequest({\n  method: 'GET', url: 'https://date.nager.at/api/v3/PublicHolidays/' + anio + '/' + pais,\n  json: true, timeout: 10000\n});\nconst servicio = new ServicioFacturacion(new CalendarioLaboral(clienteFeriados, 'CR'));\nconst salida = [];\nfor (const entrada of entradas) {\n  if (entrada.json.error) {\n    salida.push({ json: { actualizar: false, tipo: 'JSON_SERVER_LECTURA', error: 'No se pudieron leer las facturas' } });\n    continue;\n  }\n  const datos = Array.isArray(entrada.json) ? entrada.json : [entrada.json];\n  for (const resultado of await servicio.procesarTodas(datos)) salida.push({ json: resultado });\n}\nreturn salida;\n"
+      }
+    },
+    {
+      "id": "if",
+      "name": "Actualizar factura valida",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        700,
+        0
+      ],
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "es-valida",
+              "leftValue": "={{ $json.actualizar }}",
+              "rightValue": true,
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      }
+    },
+    {
+      "id": "actualizar",
+      "name": "Actualizar JSON Server",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        940,
+        -100
+      ],
+      "onError": "continueRegularOutput",
+      "parameters": {
+        "method": "PATCH",
+        "url": "={{ 'http://localhost:3000/facturas/' + encodeURIComponent($json.id) }}",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify($json.factura) }}",
+        "options": {
+          "timeout": 10000
+        }
+      }
+    },
+    {
+      "id": "resultado",
+      "name": "Resultado de actualizacion",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1180,
+        -100
+      ],
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "return $input.all().map(item => ({ json: item.json.error ? { actualizar: false, tipo: 'JSON_SERVER_ACTUALIZACION', error: 'No se pudo persistir la factura; revisar y reintentar' } : { tipo: 'ACTUALIZADA', factura: item.json } }));"
+      }
+    },
+    {
+      "id": "incidencias",
+      "name": "Errores y omisiones",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        940,
+        120
+      ],
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "return $input.all();"
+      }
+    }
+  ],
+  "connections": {
+    "Inicio manual": {
+      "main": [
+        [
+          {
+            "node": "Leer facturas",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Leer facturas": {
+      "main": [
+        [
+          {
+            "node": "Calcular con POO y Nager",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Calcular con POO y Nager": {
+      "main": [
+        [
+          {
+            "node": "Actualizar factura valida",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Actualizar factura valida": {
+      "main": [
+        [
+          {
+            "node": "Actualizar JSON Server",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Errores y omisiones",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Actualizar JSON Server": {
+      "main": [
+        [
+          {
+            "node": "Resultado de actualizacion",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "active": false,
+  "settings": {
+    "executionOrder": "v1"
+  },
+  "pinData": {},
+  "tags": []
+}
